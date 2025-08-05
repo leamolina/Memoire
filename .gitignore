@@ -1,0 +1,19 @@
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.txt
+*.xlsx
+/Analyse_alignement_series
+/Analyse_kmedoids
+/Analyse_kmedoids_DTW
+/Data
+/Data/AllMonths
+/Data Analysis
+/Old
+/Plots
+/results_catch22
+/results_catch22/Interface_4
+/results_catch22/Interface
+/results_catch22/Logical Connection

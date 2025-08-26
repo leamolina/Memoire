@@ -6,6 +6,7 @@
 *.txt
 *.xlsx
 /Analyse_alignement_series
+/Analyse_alignement_series_night
 /Analyse_kmedoids
 /Analyse_kmedoids_DTW
 /Data

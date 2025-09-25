@@ -3,11 +3,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-import optuna
 import joblib
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+from sklearn.linear_model import SGDRegressor
+from sklearn.base import clone
+
+from sklearn.preprocessing import StandardScaler
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
 
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
@@ -21,26 +27,111 @@ from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 
+
+def safe_mape(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    mask = y_true != 0
+    if not np.any(mask):
+        return np.nan
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+def smape(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+    mask = denom != 0
+    if not np.any(mask):
+        return np.nan
+    return np.mean(np.abs(y_pred[mask] - y_true[mask]) / denom[mask]) * 100
+
+# --- Réglages globaux rapides ---
+BIG_CLUSTER_ROWS = 1_000_000        # seuil à partir duquel on passe en "mode rapide"
+TUNE_MAX_ROWS    = 200_000          # sous-échantillon max pour l'optim des hyperparams
+CV_FOLDS_BIG     = 3                # CV réduite pour gros clusters
+CV_FOLDS_SMALL   = 5
+
+TRIALS = {                           # nb d'essais Optuna par modèle
+    'LinearRegression': 1,           # pas d'espace de recherche
+    'Ridge': 25,
+    'Lasso': 25,
+    'ElasticNet': 40,
+    'RandomForest': 30,              # on garde petit
+    'GradientBoosting': 40,
+    'XGBoost': 60,
+    'LightGBM': 60,
+    'CatBoost': 60,
+    'SVR': 30,
+}
+
+# Pruner: stoppe tôt les essais mediocres
+import optuna
+PRUNER = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+
+
 # Création du dossier pour sauvegarder les résultats
 os.makedirs("TimeSeries_forecasting", exist_ok=True)
 
 # 1. Récupération des données
 def load_data():
     print("Chargement des données...")
-    # Chargez votre jeu de données principal
-    df = pd.read_csv('Data\AllMonths\data_cleaned_interface.csv')
-    
-    # Chargez les assignations de cluster
-    cluster_df = pd.read_csv('cluster_assignement.csv')
-    
-    # Essayez de charger les features d'extraction si disponibles
-    try:
-        features_df = pd.read_csv('results_catch22\Interface_4\features_df.csv')
-        print("Features d'extraction chargées avec succès.")
-        return df, cluster_df, features_df
-    except:
-        print("Features d'extraction non disponibles. Poursuite sans ces features.")
-        return df, cluster_df, None
+
+    # --- Données principales
+    df = pd.read_csv('Data_night/data_complete_interface.csv')
+
+    # --- Assignations de clusters
+    cluster_df = pd.read_csv('results_catch22_6/Interface/cluster_assignments_KMeans_Subspace_spectral_3.csv')
+
+    # Harmonisation des noms de colonnes attendues
+    # (ajuste si tes fichiers utilisent d'autres noms)
+    if 'ci_name' not in df.columns:
+        # essaies courants : 'ci', 'CI_NAME'
+        for alt in ['ci', 'CI_NAME', 'device_name']:
+            if alt in df.columns:
+                df = df.rename(columns={alt: 'ci_name'})
+                break
+
+    if 'ci_name' not in cluster_df.columns:
+        for alt in ['ci', 'CI_NAME', 'device_name']:
+            if alt in cluster_df.columns:
+                cluster_df = cluster_df.rename(columns={alt: 'ci_name'})
+                break
+
+    if 'cluster' not in cluster_df.columns:
+        for alt in ['cluster_id', 'Cluster', 'CLUSTER']:
+            if alt in cluster_df.columns:
+                cluster_df = cluster_df.rename(columns={alt: 'cluster'})
+                break
+    """
+    # --- Features d'extraction (optionnelles)
+    features_df = None
+    candidate_paths = [
+        'features_df.csv'
+    ]
+    for p in candidate_paths:
+        if os.path.exists(p):
+            try:
+                features_df = pd.read_csv(p)
+                # Harmonise ci_name si besoin
+                if 'ci_name' not in features_df.columns:
+                    for alt in ['ci', 'CI_NAME', 'device_name']:
+                        if alt in features_df.columns:
+                            features_df = features_df.rename(columns={alt: 'ci_name'})
+                            break
+                print("Features d'extraction chargées avec succès.")
+                break
+            except Exception as e:
+                print(f"Impossible de charger {p}: {e}")
+    """
+    # --- Vérifs minimales
+    missing_cols = []
+    if 'ci_name' not in df.columns: missing_cols.append("df.ci_name")
+    if 'ci_name' not in cluster_df.columns: missing_cols.append("cluster_df.ci_name")
+    if 'cluster' not in cluster_df.columns: missing_cols.append("cluster_df.cluster")
+    if missing_cols:
+        raise ValueError(f"Colonnes manquantes: {', '.join(missing_cols)}")
+
+    return df, cluster_df                   
 
 # Fonction pour convertir les colonnes de date
 def convert_date_columns(df):
@@ -49,6 +140,38 @@ def convert_date_columns(df):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col])
     return df
+
+# === après feature_engineering(...) et le merge features_df, pour chaque split ===
+def memory_safe_numeric_impute(train_df, test_df):
+    num_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+
+    # union: colonnes avec NaN dans train OU dans test
+    nan_cols = [c for c in num_cols
+                if train_df[c].isna().any() or test_df[c].isna().any()]
+
+    if not nan_cols:
+        return train_df, test_df
+
+    # nettoyer inf/-inf -> NaN
+    for df in (train_df, test_df):
+        df[nan_cols] = df[nan_cols].replace([np.inf, -np.inf], np.nan)
+
+    # downcast float
+    for c in nan_cols:
+        if pd.api.types.is_float_dtype(train_df[c]):
+            train_df[c] = pd.to_numeric(train_df[c], downcast='float')
+        if pd.api.types.is_float_dtype(test_df[c]):
+            test_df[c]  = pd.to_numeric(test_df[c],  downcast='float')
+
+    # médianes sur le TRAIN uniquement
+    med = train_df[nan_cols].median()
+
+    # imputation
+    train_df[nan_cols] = train_df[nan_cols].fillna(med)
+    test_df[nan_cols]  = test_df[nan_cols].fillna(med)
+
+    return train_df, test_df
+
 
 # Fonction pour analyser les données manquantes
 def analyze_missing_data(df, cluster_id):
@@ -96,7 +219,7 @@ def handle_missing_data(df, cluster_id):
         elif missing_pct >= 5 and missing_pct < 15:
             # Utiliser KNN pour les colonnes avec un nombre modéré de valeurs manquantes
             imputer = KNNImputer(n_neighbors=5)
-            df[col] = imputer.fit_transform(df[[col]])
+            df[col] = imputer.fit_transform(df[[col]])[:, 0]
         elif missing_pct >= 15:
             # Pour les colonnes avec beaucoup de valeurs manquantes, créer un indicateur
             df[f"{col}_missing"] = df[col].isnull().astype(int)
@@ -111,493 +234,587 @@ def handle_missing_data(df, cluster_id):
     
     return df
 
-# Fonction pour le feature engineering
-def feature_engineering(df, cluster_id):
+
+def make_ohe():
+    # scikit-learn 1.2+ : 'sparse_output'; avant : 'sparse'
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+def prepare_features_df(features_df, k_max=256):
+    f = features_df.copy()
+
+    # gardons ci_name + numériques seulement
+    num_cols = f.select_dtypes(include=[np.number]).columns.tolist()
+    cols = ['ci_name'] + num_cols
+    f = f.loc[:, [c for c in cols if c in f.columns]]
+
+    # une seule ligne par ci_name (si plusieurs lignes existent)
+    if f['ci_name'].duplicated().any():
+        f = f.groupby('ci_name', as_index=False).mean(numeric_only=True)
+
+    # supprimer colonnes constantes / toutes NaN
+    nunique = f.nunique(dropna=False)
+    drop_const = nunique[(nunique <= 1) & (nunique.index != 'ci_name')].index.tolist()
+    f = f.drop(columns=drop_const)
+
+    # prioriser par variance et limiter à k_max
+    num_cols = f.select_dtypes(include=[np.number]).columns
+    if len(num_cols) > k_max:
+        var = f[num_cols].var().sort_values(ascending=False)
+        topk = var.head(k_max).index.tolist()
+        f = f[['ci_name'] + topk]
+
+    # downcast en float32 pour diviser la mémoire par ~2
+    for c in f.select_dtypes(include=[np.number]).columns:
+        f[c] = pd.to_numeric(f[c], downcast='float')
+
+    # préfixe pour éviter collisions de noms
+    ren = {c: f'fx_{c}' for c in f.columns if c not in ['ci_name']}
+    f = f.rename(columns=ren)
+
+    return f
+
+
+def feature_engineering(df, cluster_id, light=True):
     print(f"Feature engineering pour le cluster {cluster_id}...")
-    
-    # Copie pour éviter les warnings
-    df = df.copy()
-    
-    # 1. Features temporelles supplémentaires
+
+    # ⚠️ éviter la copie intégrale : df = df.copy() fait un double de tout
+    # garde df tel quel, ou fais une copie seulement des colonnes que tu crées
+    # df = df.copy()  # -> commenter pour limiter les pics mémoire
+
+    # 0) dtypes compacts dès le début
+    for c in df.select_dtypes(include=['float64']).columns:
+        df[c] = pd.to_numeric(df[c], downcast='float')
+    for c in df.select_dtypes(include=['int64']).columns:
+        # attention: si des NaN possibles, garde float32; int32 ne supporte pas NaN
+        if not df[c].isna().any():
+            df[c] = pd.to_numeric(df[c], downcast='integer')
+
+    # 1) Features temporelles
     if 'event_date_time' in df.columns:
-        # Extraire l'année, le mois, le trimestre
-        df['Year'] = df['event_date_time'].dt.year
-        df['Month'] = df['event_date_time'].dt.month
-        df['Quarter'] = df['event_date_time'].dt.quarter
-        
-        # Jour de l'année et semaine de l'année
-        df['Day_of_year'] = df['event_date_time'].dt.dayofyear
-        df['Week_of_year'] = df['event_date_time'].dt.isocalendar().week
-        
-        # Transformations cycliques pour le mois
-        df['Month_sin'] = np.sin(2 * np.pi * df['Month'] / 12)
-        df['Month_cos'] = np.cos(2 * np.pi * df['Month'] / 12)
-        
-        # Indicateur de début, milieu et fin de mois
-        df['Is_month_start'] = (df['event_date_time'].dt.day <= 5).astype(int)
-        df['Is_month_middle'] = ((df['event_date_time'].dt.day > 5) & 
-                                (df['event_date_time'].dt.day <= 25)).astype(int)
-        df['Is_month_end'] = (df['event_date_time'].dt.day > 25).astype(int)
-        
-        # Indicateur de début et fin de semaine
-        df['Is_week_start'] = (df['event_date_time'].dt.dayofweek == 0).astype(int)
-        df['Is_week_end'] = (df['event_date_time'].dt.dayofweek == 4).astype(int)
-        
-        # Partie de la journée
+        edt = df['event_date_time']
+        df['Year']        = edt.dt.year.astype('int16')
+        df['Month']       = edt.dt.month.astype('int8')
+        df['Quarter']     = edt.dt.quarter.astype('int8')
+        df['Day_of_year'] = edt.dt.dayofyear.astype('int16')
+        df['Week_of_year']= edt.dt.isocalendar().week.astype('int16')
+        df['Hour']        = edt.dt.hour.astype('int8')
+        df['Is_weekend']  = (edt.dt.dayofweek >= 5).astype('int8')
+
+        # cycliques en float32
+        df['Month_sin'] = np.sin(2*np.pi*df['Month']/12.).astype('float32')
+        df['Month_cos'] = np.cos(2*np.pi*df['Month']/12.).astype('float32')
+
+        df['Is_month_start']  = (edt.dt.day <= 5).astype('int8')
+        df['Is_month_middle'] = ((edt.dt.day > 5) & (edt.dt.day <= 25)).astype('int8')
+        df['Is_month_end']    = (edt.dt.day > 25).astype('int8')
+        df['Is_week_start']   = (edt.dt.dayofweek == 0).astype('int8')
+        df['Is_week_end']     = (edt.dt.dayofweek == 4).astype('int8')
+
+        # Part_of_day -> garde la variable catégorielle; PAS de get_dummies ici
         df['Part_of_day'] = pd.cut(
-            df['Hour'], 
-            bins=[0, 6, 12, 18, 24], 
-            labels=['Night', 'Morning', 'Afternoon', 'Evening']
+            df['Hour'], bins=[0,6,12,18,24],
+            labels=['Night','Morning','Afternoon','Evening'],
+            right=True, include_lowest=True
         )
-        
-        # One-hot encoding pour Part_of_day
-        part_of_day_dummies = pd.get_dummies(df['Part_of_day'], prefix='Part_of_day')
-        df = pd.concat([df, part_of_day_dummies], axis=1)
-        
-    # 2. Features de lag supplémentaires (par équipement)
+
+    # 2) Lags & rollings — version “light”
     if 'event_value' in df.columns and 'ci_name' in df.columns:
-        # Trier par équipement et date
-        df = df.sort_values(['ci_name', 'event_date_time'])
-        
-        # Créer des lags supplémentaires (2, 3, 6, 12, 24 heures)
-        for lag in [2, 3, 6, 12, 24]:
-            df[f'Lag_{lag}'] = df.groupby('ci_name')['event_value'].shift(lag)
-        
-        # Différences entre les lags
-        df['Diff_1'] = df['event_value'] - df['Lag_1']
-        df['Diff_2'] = df['Lag_1'] - df['Lag_2']
-        
-        # Taux de changement
-        df['Rate_of_change_1'] = df['Diff_1'] / (df['Lag_1'] + 1e-10)  # Éviter division par zéro
-        
-        # Moyennes mobiles supplémentaires
-        for window in [6, 12, 24]:
-            df[f'Rolling_mean_{window}'] = df.groupby('ci_name')['event_value'].transform(
-                lambda x: x.rolling(window=window, min_periods=1).mean())
-            df[f'Rolling_std_{window}'] = df.groupby('ci_name')['event_value'].transform(
-                lambda x: x.rolling(window=window, min_periods=1).std())
-            df[f'Rolling_min_{window}'] = df.groupby('ci_name')['event_value'].transform(
-                lambda x: x.rolling(window=window, min_periods=1).min())
-            df[f'Rolling_max_{window}'] = df.groupby('ci_name')['event_value'].transform(
-                lambda x: x.rolling(window=window, min_periods=1).max())
-        
-        # Écart par rapport à la moyenne mobile
-        df['Deviation_from_mean_3'] = df['event_value'] - df['Rolling_mean_3']
-        df['Deviation_from_mean_12'] = df['event_value'] - df['Rolling_mean_12']
-        
-        # Z-score par rapport à la fenêtre mobile
-        df['Z_score_12'] = df['Deviation_from_mean_12'] / (df['Rolling_std_12'] + 1e-10)
-        
-        # Indicateurs de tendance
-        df['Trend_up'] = ((df['Rolling_mean_3'] > df['Rolling_mean_12']) & 
-                          (df['Rolling_mean_12'] > df['Rolling_mean_24'])).astype(int)
-        df['Trend_down'] = ((df['Rolling_mean_3'] < df['Rolling_mean_12']) & 
-                           (df['Rolling_mean_12'] < df['Rolling_mean_24'])).astype(int)
-        
-        # Volatilité relative
-        df['Relative_volatility'] = df['Rolling_std_12'] / (df['Rolling_mean_12'] + 1e-10)
-    
-    # 3. Features basées sur les heures d'ouverture
+        df.sort_values(['ci_name','event_date_time'], inplace=True)
+
+        # Lags essentiels uniquement (réduis la liste si besoin)
+        for lag in [1, 3, 12, 24]:
+            df[f'Lag_{lag}'] = df.groupby('ci_name')['event_value'].shift(lag).astype('float32')
+
+        # Diff simple
+        df['Diff_1'] = (df['event_value'] - df['Lag_1']).astype('float32')
+
+        # Rollings : limite-toi à 2 fenêtres et 2 stats (mean/std)
+        windows = [6, 24] if light else [3, 6, 12, 24]
+        for w in windows:
+            # transform -> évite les MultiIndex temporaires de groupby.rolling
+            mean_w = df.groupby('ci_name')['event_value'].transform(
+                lambda s: s.rolling(window=w, min_periods=2).mean()
+            ).astype('float32')
+            std_w = df.groupby('ci_name')['event_value'].transform(
+                lambda s: s.rolling(window=w, min_periods=2).std()
+            ).astype('float32')
+
+            df[f'Rolling_mean_{w}'] = mean_w
+            df[f'Rolling_std_{w}']  = std_w
+
+        # Déviations/z-score avec la fenêtre la plus “lente” existante
+        base_w = 24 if 24 in windows else windows[-1]
+        df['Deviation_from_mean'] = (df['event_value'] - df[f'Rolling_mean_{base_w}']).astype('float32')
+        df['Z_score'] = (df['Deviation_from_mean'] / (df[f'Rolling_std_{base_w}'] + 1e-6)).astype('float32')
+
+        # Trend simple
+        if all(f'Rolling_mean_{w}' in df.columns for w in [6, 24]):
+            df['Trend_up'] = (df['Rolling_mean_6'] > df['Rolling_mean_24']).astype('int8')
+            df['Trend_down'] = (df['Rolling_mean_6'] < df['Rolling_mean_24']).astype('int8')
+
+    # 3) Heures d'ouverture
     if 'site_business_hour' in df.columns and 'Hour' in df.columns:
-        # Créer un indicateur si l'heure actuelle est dans les heures d'ouverture
-        # Supposons que site_business_hour contient des plages comme "9-17"
+        # vectorisé et int8
+        sbh = df['site_business_hour'].astype(str).str.split('-', expand=True)
         try:
-            df['Is_business_hour'] = df.apply(
-                lambda row: 1 if row['Hour'] >= int(row['site_business_hour'].split('-')[0]) and 
-                                 row['Hour'] <= int(row['site_business_hour'].split('-')[1]) 
-                                 else 0, axis=1)
-        except:
-            print("Impossible de créer Is_business_hour, format de site_business_hour non standard")
-    
-    # 4. Features d'interaction
+            start = pd.to_numeric(sbh[0], errors='coerce').fillna(-1)
+            end   = pd.to_numeric(sbh[1], errors='coerce').fillna(-1)
+            df['Is_business_hour'] = ((start <= df['Hour']) & (df['Hour'] <= end)).astype('int8')
+        except Exception:
+            df['Is_business_hour'] = 0
+
+    # 4) Interactions légères
     if 'Is_weekend' in df.columns and 'Hour' in df.columns:
-        df['Weekend_hour'] = df['Is_weekend'] * df['Hour']
-    
+        df['Weekend_hour'] = (df['Is_weekend'] * df['Hour']).astype('int16')
+
     if 'site_criticallity' in df.columns and 'Hour' in df.columns:
-        # Convertir site_criticallity en numérique pour l'interaction
-        criticality_map = {'low': 1, 'medium': 2, 'high': 3, 'very high': 4}
-        df['criticality_numeric'] = df['site_criticallity'].map(criticality_map).fillna(0)
-        df['Criticality_hour'] = df['criticality_numeric'] * df['Hour']
-    
-    # 5. Encodage des variables catégorielles
-    categorical_cols = ['ci_type', 'device_role', 'site_criticallity', 'site_country', 'site_city']
-    for col in categorical_cols:
-        if col in df.columns:
-            # One-hot encoding
-            dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
-            df = pd.concat([df, dummies], axis=1)
-    
-    # Visualiser la distribution des nouvelles features numériques
-    numeric_features = df.select_dtypes(include=['float64', 'int64']).columns
-    
-    plt.figure(figsize=(15, 10))
-    for i, feature in enumerate(numeric_features[:16]):  # Limiter à 16 features pour la lisibilité
-        plt.subplot(4, 4, i+1)
-        sns.histplot(df[feature], kde=True)
-        plt.title(feature)
-    plt.tight_layout()
-    plt.savefig(f"TimeSeries_forecasting/cluster_{cluster_id}_feature_distributions.png")
-    plt.close()
-    
+        criticality_map = {'low':1,'medium':2,'high':3,'very high':4}
+        df['criticality_numeric'] = df['site_criticallity'].map(criticality_map).fillna(0).astype('int8')
+        df['Criticality_hour'] = (df['criticality_numeric'] * df['Hour']).astype('int16')
+
+    # 5) Plot : désactive si trop gros (sinon seaborn alloue beaucoup)
+    try:
+        nrows = len(df)
+        if nrows <= 300_000:  # seuil de sécurité
+            numeric_features = df.select_dtypes(include=['float32','float64','int8','int16','int32','uint8']).columns
+            plt.figure(figsize=(15,10))
+            for i, feature in enumerate(list(numeric_features[:16])):
+                plt.subplot(4,4,i+1)
+                sns.histplot(df[feature].dropna().sample(min(100_000, df[feature].notna().sum()), random_state=42), kde=False)
+                plt.title(feature)
+            plt.tight_layout()
+            plt.savefig(f"TimeSeries_forecasting/cluster_{cluster_id}_feature_distributions.png")
+            plt.close()
+        else:
+            print(f"Plots ignorés (n={nrows:,})")
+    except Exception as e:
+        print(f"Impossible de générer les distributions des features: {e}")
+
     return df
 
-# Fonction pour la sélection de features
-def select_features(X_train, y_train, X_test, cluster_id):
+
+
+def select_features(X_train, y_train, X_test, cluster_id,
+                    max_rows=200_000,     # nombre max de lignes pour la sélection
+                    max_cols_corr=150,    # nombre max de colonnes pour la corrélation pairwise/heatmap
+                    rf_trees=50):         # n_estimators RF pour importance
+
     print(f"Sélection des features pour le cluster {cluster_id}...")
-    
-    # 1. Corrélation avec la cible
-    correlation_scores = {}
-    for col in X_train.columns:
-        if X_train[col].dtype in ['int64', 'float64']:
-            correlation_scores[col] = abs(np.corrcoef(X_train[col], y_train)[0, 1])
-    
-    correlation_df = pd.DataFrame({
-        'Feature': list(correlation_scores.keys()),
-        'Correlation': list(correlation_scores.values())
-    }).sort_values('Correlation', ascending=False)
-    
-    # Sauvegarder les scores de corrélation
-    correlation_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_correlation_scores.csv")
-    
-    # Visualiser les top corrélations
-    plt.figure(figsize=(12, 8))
-    sns.barplot(x='Correlation', y='Feature', data=correlation_df.head(20))
-    plt.title(f'Top 20 Features par Corrélation - Cluster {cluster_id}')
-    plt.tight_layout()
-    plt.savefig(f"TimeSeries_forecasting/cluster_{cluster_id}_correlation_features.png")
-    plt.close()
-    
-        # 2. Matrice de corrélation pour détecter la multicolinéarité
-    corr_matrix = X_train.corr()
-    plt.figure(figsize=(20, 16))
+
+    # 0) Downcast pour réduire la mémoire
+    def _downcast_df(df):
+        for c in df.select_dtypes(include=['float64']).columns:
+            df[c] = pd.to_numeric(df[c], downcast='float')
+        for c in df.select_dtypes(include=['int64']).columns:
+            if not df[c].isna().any():
+                df[c] = pd.to_numeric(df[c], downcast='integer')
+        return df
+
+    X_train = _downcast_df(X_train)
+    X_test  = _downcast_df(X_test)
+    # y en float32
+    y_train = pd.Series(pd.to_numeric(y_train, downcast='float'), index=y_train.index)
+
+    # 1) Sous-échantillonnage lignes pour calculs lourds
+    if len(X_train) > max_rows:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(X_train), size=max_rows, replace=False)
+        Xs = X_train.iloc[idx].copy()
+        ys = y_train.iloc[idx].copy()
+    else:
+        Xs, ys = X_train, y_train
+
+    # 2) Retirer colonnes constantes/NA-only AVANT tout
+    nunique = Xs.nunique(dropna=False)
+    const_cols = nunique[nunique <= 1].index.tolist()
+    if const_cols:
+        Xs.drop(columns=const_cols, inplace=True)
+        X_train = X_train.drop(columns=const_cols, errors='ignore')
+        X_test  = X_test.drop(columns=const_cols,  errors='ignore')
+
+    # 3) Corrélation simple avec la cible (sur Xs, ys)
+    corr_scores = {}
+    for col in Xs.columns:
+        s = Xs[col]
+        if np.issubdtype(s.dtype, np.number):
+            try:
+                v = np.corrcoef(s.fillna(s.median()), ys)[0, 1]
+                if np.isfinite(v):
+                    corr_scores[col] = abs(v)
+            except Exception:
+                pass
+    correlation_df = (pd.DataFrame({'Feature': list(corr_scores.keys()),
+                                    'Correlation': list(corr_scores.values())})
+                      .sort_values('Correlation', ascending=False))
+    correlation_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_correlation_scores.csv", index=False)
+
+    # 4) Sélection provisoire par corrélation (réduit l’espace)
+    top_corr_keep = set(correlation_df.head(max_cols_corr * 2)['Feature'])  # un peu large
+    Xs_small = Xs[list(top_corr_keep)]
+
+    # 5) Matrice de corrélation pairwise (sur max_cols_corr pour éviter O(p²) massif)
+    corr_cols = list(correlation_df.head(max_cols_corr)['Feature'])
+    corr_matrix = Xs_small[corr_cols].corr()
+    # heatmap facultatif (peut être lourd) : on garde mais sans annot et taille raisonnable
+    plt.figure(figsize=(min(20, 0.2*len(corr_cols)+6), min(16, 0.2*len(corr_cols)+6)))
     mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
-    sns.heatmap(corr_matrix, mask=mask, annot=False, cmap='coolwarm', 
-                linewidths=0.5, vmin=-1, vmax=1)
-    plt.title(f'Matrice de Corrélation - Cluster {cluster_id}')
+    sns.heatmap(corr_matrix, mask=mask, annot=False, cmap='coolwarm',
+                linewidths=0.2, vmin=-1, vmax=1)
+    plt.title(f'Matrice de Corrélation (subset) - Cluster {cluster_id}')
     plt.tight_layout()
     plt.savefig(f"TimeSeries_forecasting/cluster_{cluster_id}_correlation_matrix.png")
     plt.close()
-    
-    # Identifier les paires de features hautement corrélées (|corr| > 0.95)
+
+    # 6) Paires très corrélées (|corr| > 0.95) sur le subset
     high_corr_pairs = []
-    for i in range(len(corr_matrix.columns)):
-        for j in range(i+1, len(corr_matrix.columns)):
-            if abs(corr_matrix.iloc[i, j]) > 0.95:
-                high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j], corr_matrix.iloc[i, j]))
-    
+    cols = corr_matrix.columns
+    for i in range(len(cols)):
+        for j in range(i+1, len(cols)):
+            cij = corr_matrix.iloc[i, j]
+            if abs(cij) > 0.95:
+                high_corr_pairs.append((cols[i], cols[j], cij))
     high_corr_df = pd.DataFrame(high_corr_pairs, columns=['Feature1', 'Feature2', 'Correlation'])
-    high_corr_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_high_correlation_pairs.csv")
-    
-    # 3. Feature importance avec Random Forest
-    rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf.fit(X_train, y_train)
-    
-    feature_importance = pd.DataFrame({
-        'Feature': X_train.columns,
-        'Importance': rf.feature_importances_
-    }).sort_values('Importance', ascending=False)
-    
-    feature_importance.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_feature_importance.csv")
-    
-    plt.figure(figsize=(12, 8))
-    sns.barplot(x='Importance', y='Feature', data=feature_importance.head(20))
-    plt.title(f'Top 20 Features par Importance - Cluster {cluster_id}')
-    plt.tight_layout()
-    plt.savefig(f"TimeSeries_forecasting/cluster_{cluster_id}_feature_importance.png")
-    plt.close()
-    
-    # 4. Information mutuelle (pour capturer les relations non linéaires)
-    mi_scores = mutual_info_regression(X_train, y_train)
-    mi_df = pd.DataFrame({
-        'Feature': X_train.columns,
-        'MI_Score': mi_scores
-    }).sort_values('MI_Score', ascending=False)
-    
-    mi_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_mutual_info_scores.csv")
-    
-    plt.figure(figsize=(12, 8))
-    sns.barplot(x='MI_Score', y='Feature', data=mi_df.head(20))
-    plt.title(f'Top 20 Features par Information Mutuelle - Cluster {cluster_id}')
-    plt.tight_layout()
-    plt.savefig(f"TimeSeries_forecasting/cluster_{cluster_id}_mutual_info.png")
-    plt.close()
-    
-    # 5. Sélection des features finales
-    # Combiner les scores de différentes méthodes
-    combined_scores = pd.DataFrame({'Feature': X_train.columns})
-    combined_scores = combined_scores.merge(correlation_df, on='Feature', how='left')
-    combined_scores = combined_scores.merge(feature_importance, on='Feature', how='left')
-    combined_scores = combined_scores.merge(mi_df, on='Feature', how='left')
-    
-    # Normaliser les scores
+    high_corr_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_high_correlation_pairs.csv", index=False)
+
+    # 7) RandomForest importance (sur Xs_small) — version LIGHT
+    #    -> n_jobs=1 (évite la duplication mémoire par worker)
+    #    -> bootstrap=True + max_samples (subsample par arbre)
+    from sklearn.ensemble import RandomForestRegressor
+    rf = RandomForestRegressor(
+        n_estimators=rf_trees,
+        max_depth=12,
+        min_samples_leaf=5,
+        max_features='sqrt',
+        bootstrap=True,
+        max_samples=0.25,   # 25% des lignes par arbre
+        random_state=42,
+        n_jobs=1
+    )
+    rf.fit(Xs_small.fillna(Xs_small.median()), ys)
+    rf_imp = (pd.DataFrame({'Feature': Xs_small.columns, 'Importance': rf.feature_importances_})
+                .sort_values('Importance', ascending=False))
+    rf_imp.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_feature_importance.csv", index=False)
+
+    # 8) Information mutuelle (sur Xs_small)
+    from sklearn.feature_selection import mutual_info_regression
+    mi_scores = mutual_info_regression(Xs_small.fillna(Xs_small.median()), ys, random_state=42)
+    mi_df = (pd.DataFrame({'Feature': Xs_small.columns, 'MI_Score': mi_scores})
+                .sort_values('MI_Score', ascending=False))
+    mi_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_mutual_info_scores.csv", index=False)
+
+    # 9) Combinaison des scores (sur l’intersection des colonnes évaluées)
+    common = list(set(Xs_small.columns) & set(correlation_df['Feature']))
+    combined = pd.DataFrame({'Feature': common})
+    combined = combined.merge(correlation_df, on='Feature', how='left')
+    combined = combined.merge(rf_imp, on='Feature', how='left')
+    combined = combined.merge(mi_df, on='Feature', how='left')
+
     for col in ['Correlation', 'Importance', 'MI_Score']:
-        if col in combined_scores.columns:
-            combined_scores[f'{col}_norm'] = combined_scores[col] / combined_scores[col].max()
-    
-    # Score combiné
-    score_cols = [col for col in combined_scores.columns if col.endswith('_norm')]
-    combined_scores['Combined_Score'] = combined_scores[score_cols].mean(axis=1)
-    combined_scores = combined_scores.sort_values('Combined_Score', ascending=False)
-    
-    combined_scores.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_combined_feature_scores.csv")
-    
-    # Sélectionner les top features (par exemple, top 50 ou score > 0.1)
-    top_features = combined_scores[combined_scores['Combined_Score'] > 0.1]['Feature'].tolist()
-    
-    # Si trop peu de features sont sélectionnées, prendre les top 50
-    if len(top_features) < 50:
-        top_features = combined_scores.head(50)['Feature'].tolist()
-    
-    # Éliminer les features hautement corrélées
-    features_to_drop = set()
-    for _, row in high_corr_df.iterrows():
-        # Garder celle avec le score combiné le plus élevé
-        feature1_score = combined_scores[combined_scores['Feature'] == row['Feature1']]['Combined_Score'].values[0]
-        feature2_score = combined_scores[combined_scores['Feature'] == row['Feature2']]['Combined_Score'].values[0]
-        
-        if feature1_score >= feature2_score:
-            features_to_drop.add(row['Feature2'])
+        if col in combined.columns and combined[col].notna().any():
+            m = combined[col].max()
+            if m and np.isfinite(m) and m > 0:
+                combined[f'{col}_norm'] = combined[col] / m
+            else:
+                combined[f'{col}_norm'] = 0.0
         else:
-            features_to_drop.add(row['Feature1'])
-    
-    # Filtrer les features finales
+            combined[f'{col}_norm'] = 0.0
+
+    score_cols = [c for c in combined.columns if c.endswith('_norm')]
+    combined['Combined_Score'] = combined[score_cols].mean(axis=1)
+    combined = combined.sort_values('Combined_Score', ascending=False)
+    combined.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_combined_feature_scores.csv", index=False)
+
+    # 10) Sélection finale : top-K raisonnable (ou seuil)
+    K = 100  # <- ajuste si besoin
+    top_features = combined.head(K)['Feature'].tolist()
+
+    # 11) Retirer les paires hautement corrélées (sur le subset)
+    features_to_drop = set()
+    comb_map = dict(zip(combined['Feature'], combined['Combined_Score']))
+    for _, row in high_corr_df.iterrows():
+        f1, f2 = row['Feature1'], row['Feature2']
+        if f1 in top_features and f2 in top_features:
+            s1 = comb_map.get(f1, 0)
+            s2 = comb_map.get(f2, 0)
+            if s1 >= s2:
+                features_to_drop.add(f2)
+            else:
+                features_to_drop.add(f1)
     final_features = [f for f in top_features if f not in features_to_drop]
-    
+
     print(f"Nombre de features sélectionnées pour le cluster {cluster_id}: {len(final_features)}")
-    
-    # Sauvegarder la liste des features finales
     pd.DataFrame({'Feature': final_features}).to_csv(
         f"TimeSeries_forecasting/cluster_{cluster_id}_final_features.csv", index=False)
-    
-    # Retourner les datasets filtrés
+
+    # 12) Filtrer les matrices complètes
     X_train_filtered = X_train[final_features]
-    X_test_filtered = X_test[final_features]
-    
+    X_test_filtered  = X_test[final_features]
     return X_train_filtered, X_test_filtered, final_features
+
 
 # Fonction pour l'optimisation des hyperparamètres avec Optuna
 def optimize_model(X_train, y_train, model_name, cluster_id):
     print(f"Optimisation du modèle {model_name} pour le cluster {cluster_id}...")
-    
-    # Définir l'espace de recherche des hyperparamètres selon le modèle
-    def objective(trial):
-        if model_name == 'LinearRegression':
-            model = LinearRegression()
-            
-        elif model_name == 'Ridge':
-            alpha = trial.suggest_float('alpha', 0.01, 10.0, log=True)
-            model = Ridge(alpha=alpha, random_state=42)
-            
+
+    # 0) Sous-échantillonnage lignes pour l'optim (évite de tuner sur 3.3M lignes)
+    n_rows = len(X_train)
+    if n_rows > TUNE_MAX_ROWS:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n_rows, size=TUNE_MAX_ROWS, replace=False)
+        X_tune = X_train.iloc[idx].copy()
+        y_tune = y_train.iloc[idx].copy()
+    else:
+        X_tune, y_tune = X_train, y_train
+
+    # 1) Choix du nombre de folds
+    n_splits = CV_FOLDS_BIG if n_rows >= BIG_CLUSTER_ROWS else CV_FOLDS_SMALL
+
+    is_big = len(X_train) >= BIG_CLUSTER_ROWS
+
+
+    # 2) Early stopping pour boosters (si possible)
+    def fit_with_es(model, Xtr, ytr, Xva, yva):
+        if isinstance(model, XGBRegressor):
+            model.set_params(n_estimators=500, eval_metric='rmse', verbosity=0)
+            model.fit(Xtr, ytr, eval_set=[(Xva, yva)], early_stopping_rounds=50, verbose=False)
+        elif isinstance(model, LGBMRegressor):
+            model.set_params(n_estimators=1000)
+            model.fit(Xtr, ytr, eval_set=[(Xva, yva)], callbacks=[
+                # early stopping à ~50 itérations sans gain
+                # (compat scikit lightgbm>=3.3)
+                # lgb.early_stopping(50) si tu utilises l'API native
+            ])
+        else:
+            model.fit(Xtr, ytr)
+
+    # 3) Court-circuit pour les modèles sans hyperparamètres
+    if model_name == 'LinearRegression':
+        model = LinearRegression()
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        scores = []
+        for tr, va in tscv.split(X_tune):
+            Xtr, Xva = X_tune.iloc[tr], X_tune.iloc[va]
+            ytr, yva = y_tune.iloc[tr], y_tune.iloc[va]
+            fit_with_es(model, Xtr, ytr, Xva, yva)
+            pred = model.predict(Xva)
+            scores.append(np.sqrt(mean_squared_error(yva, pred)))
+        best_rmse = float(np.mean(scores))
+        model.fit(X_train, y_train)
+        return model, {'model': model_name, 'best_params': {}, 'best_rmse': best_rmse}
+
+    # 4) Définir l'espace de recherche
+        # 4) Définir l'espace de recherche
+    def objective(trial, Xs=X_tune, ys=y_tune):
+        # IMPORTANT : capturer X_tune/y_tune pour éviter NameError
+        # et s'assurer qu'on utilise bien le sous-échantillon de tuning.
+
+        # modèles linéaires à scaler
+        linear_like = ['Ridge', 'Lasso', 'ElasticNet']
+
+        from sklearn.pipeline import Pipeline
+
+        # === Définition du modèle (identique à celle que je t'ai donnée) ===
+        if model_name == 'Ridge':
+            if is_big:
+                base = SGDRegressor(
+                    loss='squared_error', penalty='l2',
+                    alpha=trial.suggest_float('alpha', 1e-6, 1e-2, log=True),
+                    learning_rate='optimal',
+                    early_stopping=True, validation_fraction=0.1,
+                    n_iter_no_change=5, max_iter=2000, tol=1e-4,
+                    random_state=42
+                )
+            else:
+                base = Ridge(alpha=trial.suggest_float('alpha', 1e-3, 10.0, log=True))
+            model = Pipeline([('scaler', StandardScaler()), ('est', base)])
+
         elif model_name == 'Lasso':
-            alpha = trial.suggest_float('alpha', 0.001, 1.0, log=True)
-            model = Lasso(alpha=alpha, random_state=42)
-            
+            if is_big:
+                base = SGDRegressor(
+                    loss='squared_error', penalty='l1',
+                    alpha=trial.suggest_float('alpha', 1e-6, 1e-2, log=True),
+                    learning_rate='optimal',
+                    early_stopping=True, validation_fraction=0.1,
+                    n_iter_no_change=5, max_iter=2000, tol=1e-4,
+                    random_state=42
+                )
+            else:
+                base = Lasso(alpha=trial.suggest_float('alpha', 1e-4, 1.0, log=True), max_iter=50_000)
+            model = Pipeline([('scaler', StandardScaler()), ('est', base)])
+
         elif model_name == 'ElasticNet':
-            alpha = trial.suggest_float('alpha', 0.001, 1.0, log=True)
-            l1_ratio = trial.suggest_float('l1_ratio', 0.0, 1.0)
-            model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=42)
-            
+            if is_big:
+                base = SGDRegressor(
+                    loss='squared_error', penalty='elasticnet',
+                    alpha=trial.suggest_float('alpha', 1e-6, 1e-2, log=True),
+                    l1_ratio=trial.suggest_float('l1_ratio', 0.0, 1.0),
+                    learning_rate='optimal',
+                    early_stopping=True, validation_fraction=0.1,
+                    n_iter_no_change=5, max_iter=2000, tol=1e-4,
+                    random_state=42
+                )
+            else:
+                base = ElasticNet(
+                    alpha=trial.suggest_float('alpha', 1e-4, 1.0, log=True),
+                    l1_ratio=trial.suggest_float('l1_ratio', 0.0, 1.0),
+                    max_iter=50_000
+                )
+            model = Pipeline([('scaler', StandardScaler()), ('est', base)])
+
         elif model_name == 'RandomForest':
-            n_estimators = trial.suggest_int('n_estimators', 50, 300)
-            max_depth = trial.suggest_int('max_depth', 3, 30)
-            min_samples_split = trial.suggest_int('min_samples_split', 2, 20)
-            min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 10)
             model = RandomForestRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                min_samples_split=min_samples_split,
-                min_samples_leaf=min_samples_leaf,
-                random_state=42
+                n_estimators=trial.suggest_int('n_estimators', 100, 300),
+                max_depth=trial.suggest_int('max_depth', 8, 20),
+                min_samples_split=trial.suggest_int('min_samples_split', 2, 20),
+                min_samples_leaf=trial.suggest_int('min_samples_leaf', 1, 10),
+                max_features=trial.suggest_categorical('max_features', ['sqrt', 'log2']),
+                bootstrap=True, max_samples=0.2, n_jobs=1, random_state=42
             )
-            
+
         elif model_name == 'GradientBoosting':
-            n_estimators = trial.suggest_int('n_estimators', 50, 300)
-            learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
-            max_depth = trial.suggest_int('max_depth', 3, 10)
-            min_samples_split = trial.suggest_int('min_samples_split', 2, 20)
-            subsample = trial.suggest_float('subsample', 0.5, 1.0)
             model = GradientBoostingRegressor(
-                n_estimators=n_estimators,
-                learning_rate=learning_rate,
-                max_depth=max_depth,
-                min_samples_split=min_samples_split,
-                subsample=subsample,
+                n_estimators=trial.suggest_int('n_estimators', 100, 400),
+                learning_rate=trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                max_depth=trial.suggest_int('max_depth', 2, 6),
+                min_samples_split=trial.suggest_int('min_samples_split', 2, 20),
+                subsample=trial.suggest_float('subsample', 0.6, 1.0),
                 random_state=42
             )
-            
+
         elif model_name == 'XGBoost':
-            n_estimators = trial.suggest_int('n_estimators', 50, 300)
-            learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
-            max_depth = trial.suggest_int('max_depth', 3, 10)
-            subsample = trial.suggest_float('subsample', 0.5, 1.0)
-            colsample_bytree = trial.suggest_float('colsample_bytree', 0.5, 1.0)
             model = XGBRegressor(
-                n_estimators=n_estimators,
-                learning_rate=learning_rate,
-                max_depth=max_depth,
-                subsample=subsample,
-                colsample_bytree=colsample_bytree,
-                random_state=42
+                n_estimators=trial.suggest_int('n_estimators', 200, 1200),
+                learning_rate=trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                max_depth=trial.suggest_int('max_depth', 3, 10),
+                subsample=trial.suggest_float('subsample', 0.6, 1.0),
+                colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
+                reg_lambda=trial.suggest_float('reg_lambda', 0.0, 1.0),
+                random_state=42, tree_method='hist', n_jobs=1
             )
-            
+
         elif model_name == 'LightGBM':
-            n_estimators = trial.suggest_int('n_estimators', 50, 300)
-            learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
-            max_depth = trial.suggest_int('max_depth', 3, 10)
-            num_leaves = trial.suggest_int('num_leaves', 20, 100)
-            subsample = trial.suggest_float('subsample', 0.5, 1.0)
-            colsample_bytree = trial.suggest_float('colsample_bytree', 0.5, 1.0)
+            # éviter max_depth=0 — on force -1 (illimité) ou >=3
+            depth = trial.suggest_categorical('max_depth', [-1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
             model = LGBMRegressor(
-                n_estimators=n_estimators,
-                learning_rate=learning_rate,
-                max_depth=max_depth,
-                num_leaves=num_leaves,
-                subsample=subsample,
-                colsample_bytree=colsample_bytree,
-                random_state=42
+                n_estimators=trial.suggest_int('n_estimators', 300, 2000),
+                learning_rate=trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                max_depth=depth,
+                num_leaves=trial.suggest_int('num_leaves', 31, 255),
+                subsample=trial.suggest_float('subsample', 0.6, 1.0),
+                colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
+                reg_lambda=trial.suggest_float('reg_lambda', 0.0, 1.0),
+                random_state=42, n_jobs=1
             )
-            
+
         elif model_name == 'CatBoost':
-            iterations = trial.suggest_int('iterations', 50, 300)
-            learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
-            depth = trial.suggest_int('depth', 4, 10)
-            l2_leaf_reg = trial.suggest_float('l2_leaf_reg', 1e-5, 10.0, log=True)
             model = CatBoostRegressor(
-                iterations=iterations,
-                learning_rate=learning_rate,
-                depth=depth,
-                l2_leaf_reg=l2_leaf_reg,
-                random_seed=42,
-                verbose=0
+                iterations=trial.suggest_int('iterations', 300, 2000),
+                learning_rate=trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                depth=trial.suggest_int('depth', 4, 10),
+                l2_leaf_reg=trial.suggest_float('l2_leaf_reg', 1e-5, 10.0, log=True),
+                random_seed=42, verbose=False
             )
-            
+
         elif model_name == 'SVR':
-            C = trial.suggest_float('C', 0.1, 100.0, log=True)
-            epsilon = trial.suggest_float('epsilon', 0.01, 1.0, log=True)
-            gamma = trial.suggest_categorical('gamma', ['scale', 'auto'])
-            model = SVR(C=C, epsilon=epsilon, gamma=gamma)
-            
+            model = Pipeline([
+                ('scaler', StandardScaler()),
+                ('est', SVR(
+                    C=trial.suggest_float('C', 0.1, 50.0, log=True),
+                    epsilon=trial.suggest_float('epsilon', 0.01, 1.0, log=True),
+                    gamma=trial.suggest_categorical('gamma', ['scale', 'auto'])
+                ))
+            ])
         else:
             raise ValueError(f"Modèle {model_name} non supporté")
-        
-        # Validation croisée temporelle
-        tscv = TimeSeriesSplit(n_splits=5)
-        cv_scores = []
-        
-        for train_idx, val_idx in tscv.split(X_train):
-            X_train_cv, X_val_cv = X_train.iloc[train_idx], X_train.iloc[val_idx]
-            y_train_cv, y_val_cv = y_train.iloc[train_idx], y_train.iloc[val_idx]
-            
-            model.fit(X_train_cv, y_train_cv)
-            y_pred = model.predict(X_val_cv)
-            rmse = np.sqrt(mean_squared_error(y_val_cv, y_pred))
-            cv_scores.append(rmse)
-        
-        return np.mean(cv_scores)
-    
-    # Créer l'étude Optuna
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=50)
-    
-    # Récupérer les meilleurs hyperparamètres
+
+        # === CV temporelle ===
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        scores = []
+        for fold, (tr, va) in enumerate(tscv.split(Xs)):
+            if isinstance(Xs, np.ndarray):
+                Xtr, Xva = Xs[tr], Xs[va]
+            else:
+                Xtr, Xva = Xs.iloc[tr], Xs.iloc[va]
+            ytr, yva = ys.iloc[tr], ys.iloc[va]
+
+            # clone pour éviter fuites d’état entre folds (early stopping, etc.)
+            model_fold = clone(model)
+            model_fold.fit(Xtr, ytr)
+            pred = model_fold.predict(Xva)
+
+            rmse = float(np.sqrt(mean_squared_error(yva, pred)))
+            scores.append(rmse)
+            trial.report(rmse, step=fold)
+
+        return float(np.mean(scores))
+
+
+
+    # 5) Étude Optuna avec pruner + trials adaptés + TIMEOUT (ex. 30 min par modèle)
+    TIMEOUT_PER_MODEL = 30 * 60  # 30 minutes
+    study = optuna.create_study(direction='minimize', pruner=PRUNER)
+    study.optimize(objective,
+                n_trials=TRIALS.get(model_name, 50),
+                timeout=TIMEOUT_PER_MODEL)
+
+
     best_params = study.best_params
-    best_value = study.best_value
-    
-    # Sauvegarder les résultats de l'optimisation
-    results = {
-        'model': model_name,
-        'best_params': best_params,
-        'best_rmse': best_value
-    }
-    
-    # Visualiser l'importance des hyperparamètres
-    if len(best_params) > 1:  # Ne pas visualiser si un seul hyperparamètre
-        try:
-            fig = optuna.visualization.plot_param_importances(study)
-            fig.write_image(f"TimeSeries_forecasting/cluster_{cluster_id}_{model_name}_param_importance.png")
-        except:
-            print(f"Impossible de générer le graphique d'importance des hyperparamètres pour {model_name}")
-    
-    # Créer et entraîner le modèle avec les meilleurs hyperparamètres
-    best_model = None
-    
-    if model_name == 'LinearRegression':
-        best_model = LinearRegression()
-        
-    elif model_name == 'Ridge':
-        best_model = Ridge(alpha=best_params['alpha'], random_state=42)
-        
-    elif model_name == 'Lasso':
-        best_model = Lasso(alpha=best_params['alpha'], random_state=42)
-        
-    elif model_name == 'ElasticNet':
-        best_model = ElasticNet(
-            alpha=best_params['alpha'], 
-            l1_ratio=best_params['l1_ratio'], 
-            random_state=42
-        )
-        
-    elif model_name == 'RandomForest':
-        best_model = RandomForestRegressor(
-            n_estimators=best_params['n_estimators'],
-            max_depth=best_params['max_depth'],
-            min_samples_split=best_params['min_samples_split'],
-            min_samples_leaf=best_params['min_samples_leaf'],
-            random_state=42
-        )
-        
-    elif model_name == 'GradientBoosting':
-        best_model = GradientBoostingRegressor(
-            n_estimators=best_params['n_estimators'],
-            learning_rate=best_params['learning_rate'],
-            max_depth=best_params['max_depth'],
-            min_samples_split=best_params['min_samples_split'],
-            subsample=best_params['subsample'],
-            random_state=42
-        )
-        
-    elif model_name == 'XGBoost':
-        best_model = XGBRegressor(
-            n_estimators=best_params['n_estimators'],
-            learning_rate=best_params['learning_rate'],
-            max_depth=best_params['max_depth'],
-            subsample=best_params['subsample'],
-            colsample_bytree=best_params['colsample_bytree'],
-            random_state=42
-        )
-        
-    elif model_name == 'LightGBM':
-        best_model = LGBMRegressor(
-            n_estimators=best_params['n_estimators'],
-            learning_rate=best_params['learning_rate'],
-            max_depth=best_params['max_depth'],
-            num_leaves=best_params['num_leaves'],
-            subsample=best_params['subsample'],
-            colsample_bytree=best_params['colsample_bytree'],
-            random_state=42
-        )
-        
-    elif model_name == 'CatBoost':
-        best_model = CatBoostRegressor(
-            iterations=best_params['iterations'],
-            learning_rate=best_params['learning_rate'],
-            depth=best_params['depth'],
-            l2_leaf_reg=best_params['l2_leaf_reg'],
-            random_seed=42,
-            verbose=0
-        )
-        
-    elif model_name == 'SVR':
-        best_model = SVR(
-            C=best_params['C'],
-            epsilon=best_params['epsilon'],
-            gamma=best_params['gamma']
-        )
-    
-    # Entraîner le modèle sur l'ensemble des données d'entraînement
+    best_value  = study.best_value
+
+        # 6) Re-fit final sur TOUT le train avec les meilleurs hyperparams
+    from sklearn.pipeline import Pipeline
+
+    def make_best_model(name, params):
+        if name == 'Ridge':
+            base = Ridge(**params)
+            return Pipeline([('scaler', StandardScaler()), ('est', base)])
+        if name == 'Lasso':
+            base = Lasso(max_iter=50_000, **params)
+            return Pipeline([('scaler', StandardScaler()), ('est', base)])
+        if name == 'ElasticNet':
+            base = ElasticNet(max_iter=50_000, **params)
+            return Pipeline([('scaler', StandardScaler()), ('est', base)])
+        if name == 'RandomForest':
+            return RandomForestRegressor(n_jobs=1, random_state=42, **params)
+        if name == 'GradientBoosting':
+            return GradientBoostingRegressor(random_state=42, **params)
+        if name == 'XGBoost':
+            return XGBRegressor(random_state=42, tree_method='hist', n_jobs=1, **params)
+        if name == 'LightGBM':
+            return LGBMRegressor(random_state=42, n_jobs=1, **params)
+        if name == 'CatBoost':
+            return CatBoostRegressor(random_seed=42, verbose=False, **params)
+        if name == 'SVR':
+            return Pipeline([('scaler', StandardScaler()), ('est', SVR(**params))])
+        raise ValueError(name)
+
+    if model_name in ['Ridge','Lasso','ElasticNet'] and is_big:
+        # version SGD + pipeline pour les très gros volumes
+        if model_name == 'Ridge':
+            base = SGDRegressor(loss='squared_error', penalty='l2',
+                                early_stopping=False, max_iter=2000, tol=1e-4,
+                                random_state=42, **best_params)
+        elif model_name == 'Lasso':
+            base = SGDRegressor(loss='squared_error', penalty='l1',
+                                early_stopping=False, max_iter=2000, tol=1e-4,
+                                random_state=42, **best_params)
+        else:  # ElasticNet
+            base = SGDRegressor(loss='squared_error', penalty='elasticnet',
+                                early_stopping=False, max_iter=2000, tol=1e-4,
+                                random_state=42, **best_params)
+        best_model = Pipeline([('scaler', StandardScaler()), ('est', base)])
+    else:
+        best_model = make_best_model(model_name, best_params)
+
     best_model.fit(X_train, y_train)
-    
+    results = {'model': model_name, 'best_params': best_params, 'best_rmse': best_value}
     return best_model, results
+
 
 # Fonction pour évaluer les modèles
 def evaluate_model(model, X_test, y_test, model_name, cluster_id):
@@ -610,7 +827,9 @@ def evaluate_model(model, X_test, y_test, model_name, cluster_id):
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
-    mape = mean_absolute_percentage_error(y_test, y_pred) * 100  # en pourcentage
+    mape = safe_mape(y_test, y_pred)
+    smape_val = smape(y_test, y_pred)
+
     
     # Sauvegarder les métriques
     metrics = {
@@ -618,7 +837,8 @@ def evaluate_model(model, X_test, y_test, model_name, cluster_id):
         'rmse': rmse,
         'mae': mae,
         'r2': r2,
-        'mape': mape
+        'mape': mape,
+        'smape' : smape_val
     }
     
     # Visualiser les prédictions vs réalité
@@ -707,43 +927,125 @@ def process_cluster(df, cluster_id, features_df=None):
     
     # 3. Feature engineering
     train_data = feature_engineering(train_data, cluster_id)
+    # après le feature engineering, côté TRAIN uniquement
+    max_lag = 24
+    train_data = (train_data
+                .sort_values(['ci_name','event_date_time'])
+                .groupby('ci_name', group_keys=False)
+                .apply(lambda g: g.iloc[max_lag:]))  # drop les 1ères lignes insuffisantes
     test_data = feature_engineering(test_data, cluster_id)
     
     # Si features_df est disponible, fusionner avec les données
     if features_df is not None:
-        print("Fusion avec les features d'extraction...")
+        features_df = prepare_features_df(features_df, k_max=256)  # ajuste k_max si besoin
+        print("features_df compact:", features_df.shape)  # debug
         train_data = pd.merge(train_data, features_df, on='ci_name', how='left')
-        test_data = pd.merge(test_data, features_df, on='ci_name', how='left')
+        test_data  = pd.merge(test_data,  features_df, on='ci_name', how='left')
     
-    # Préparation des features et de la cible
+    # juste après feature_engineering(...) et la fusion éventuelle
+    num_cols = train_data.select_dtypes(include=[np.number]).columns
+    train_data, test_data = memory_safe_numeric_impute(train_data, test_data)
+
+
+    
+        # === Préparation des features et de la cible
     target_col = 'event_value'
-    
-    # Colonnes à exclure des features
-    exclude_cols = ['event_value', 'event_date_time', 'Date', 'cluster', 'ci_name', 
-                    'Part_of_day', 'site_name', 'site_city', 'site_country', 
-                    'site_business_hour', 'service_line']
-    
-    feature_cols = [col for col in train_data.columns if col not in exclude_cols]
-    
-    X_train = train_data[feature_cols]
-    y_train = train_data[target_col]
-    X_test = test_data[feature_cols]
-    y_test = test_data[target_col]
+    exclude_cols = [
+        'event_value', 'event_date_time', 'Date', 'cluster', 'ci_name',
+        'site_name', 'site_city', 'site_country', 'site_business_hour',
+        'service_line'
+    ]
+    feature_cols_raw = [c for c in train_data.columns if c not in exclude_cols]
+
+    # Split cat/num d’après dtypes du train
+    cat_cols = [c for c in feature_cols_raw if str(train_data[c].dtype) in ('object','category')]
+    num_cols = [c for c in feature_cols_raw if c not in cat_cols]
+
+    n_rows_train = len(train_data)
+
+    if n_rows_train >= BIG_CLUSTER_ROWS:
+        # MODE MÉMOIRE-FRIENDLY : pas d’OHE, on code les catégories
+        for c in cat_cols:
+            train_data[c] = train_data[c].astype('category').cat.codes.astype('int16')
+            test_data[c]  = test_data[c].astype('category').cat.codes.astype('int16')
+
+        feature_cols = num_cols + cat_cols  # tout numérique maintenant
+        X_train = train_data[feature_cols].astype('float32')
+        X_test  = test_data[feature_cols].astype('float32')
+        y_train = train_data[target_col].copy()
+        y_test  = test_data[target_col].copy()
+
+    else:
+        # ColumnTransformer : OHE + passthrough
+        preproc = ColumnTransformer(
+            transformers=[
+                ('cat', make_ohe(), cat_cols),
+                ('num', 'passthrough', num_cols),
+            ],
+            remainder='drop'
+        )
+        X_train_arr = preproc.fit_transform(train_data[cat_cols + num_cols])
+        X_test_arr  = preproc.transform(test_data[cat_cols + num_cols])
+
+        cat_feature_names = []
+        if len(cat_cols) > 0:
+            cat_feature_names = preproc.named_transformers_['cat'].get_feature_names_out(cat_cols)
+        feature_names = np.concatenate([cat_feature_names, np.array(num_cols)], axis=0)
+
+        X_train = pd.DataFrame(X_train_arr, columns=feature_names, index=train_data.index)
+        X_test  = pd.DataFrame(X_test_arr,  columns=feature_names, index=test_data.index)
+        y_train = train_data[target_col].copy()
+        y_test  = test_data[target_col].copy()
+
+
     
     # 4. Sélection des features
     X_train, X_test, selected_features = select_features(X_train, y_train, X_test, cluster_id)
+
+    # juste après:
+    # X_train, X_test, selected_features = select_features(...)
+
+    def sanitize_X(X_train, X_test):
+        # remplace inf/-inf par NaN
+        X_train = X_train.replace([np.inf, -np.inf], np.nan)
+        X_test  = X_test.replace([np.inf, -np.inf], np.nan)
+
+        # médianes calculées sur TRAIN (numériques uniquement)
+        med = X_train.median(numeric_only=True)
+
+        # impute
+        X_train = X_train.fillna(med)
+        X_test  = X_test.fillna(med)
+
+        # si des colonnes restent full-NaN (cas extrême), on les drop
+        bad_cols = [c for c in X_train.columns if X_train[c].isna().all()] + \
+                [c for c in X_test.columns  if X_test[c].isna().all()]
+        bad_cols = sorted(set(bad_cols))
+        if bad_cols:
+            X_train = X_train.drop(columns=bad_cols, errors='ignore')
+            X_test  = X_test.drop(columns=bad_cols, errors='ignore')
+
+        return X_train, X_test
+
+    X_train, X_test = sanitize_X(X_train, X_test)
+
     
     # 5. Optimisation et évaluation des modèles
-    models_to_try = [
-        'LinearRegression', 
-        'Ridge', 
-        'Lasso', 
-        'ElasticNet',
-        'RandomForest', 
-        'GradientBoosting', 
-        'XGBoost', 
-        'LightGBM'
-    ]
+    # choix des modèles selon la taille
+    n_rows_train = len(X_train)
+    if n_rows_train >= BIG_CLUSTER_ROWS:
+        # MODE RAPIDE: pas de RF/GB/SVR sur millions de lignes
+        models_to_try = [
+            'LinearRegression', 'Ridge', 'Lasso', 'ElasticNet',
+            'LightGBM', 'XGBoost'   # boosters -> plus efficients
+        ]
+        print(f"[Info] Gros cluster (n={n_rows_train:,}) -> MODE RAPIDE: {models_to_try}")
+    else:
+        models_to_try = [
+            'LinearRegression', 'Ridge', 'Lasso', 'ElasticNet',
+            'RandomForest', 'GradientBoosting', 'XGBoost', 'LightGBM'
+        ]
+
     
     all_results = []
     best_model_info = {'rmse': float('inf')}
@@ -805,13 +1107,142 @@ def process_cluster(df, cluster_id, features_df=None):
     print(f"MAE: {best_model_info['mae']:.4f}")
     print(f"R²: {best_model_info['r2']:.4f}")
     print(f"MAPE: {best_model_info['mape']:.2f}%")
+
+
+    # === Sauvegarde des prédictions du cluster pour le graphe final ===
+    # (on sauvegarde les prédictions sur le test set, alignées avec les colonnes d'intérêt)
+    try:
+        y_pred_full = best_model_info['model'].predict(X_test)
+        preds_df = test_data[['ci_name', 'event_date_time', 'event_value']].copy()
+        preds_df['y_pred'] = y_pred_full
+        preds_df['cluster'] = cluster_id
+        # sécurité: tri par temps
+        preds_df = preds_df.sort_values(['ci_name', 'event_date_time'])
+        preds_df.to_csv(f"TimeSeries_forecasting/cluster_{cluster_id}_predictions.csv", index=False)
+    except Exception as e:
+        print(f"[WARN] Impossible de sauvegarder les prédictions du cluster {cluster_id}: {e}")
+
+
     
     return best_model_info
+
+
+def plot_final_10_devices(time_col='event_date_time',
+                          real_col='event_value',
+                          pred_col='y_pred',
+                          out_path="TimeSeries_forecasting/final_10_devices.png",
+                          seed=42):
+    """
+    Charge tous les CSV de prédictions de clusters, prend 10 équipements distincts
+    (répartis sur plusieurs clusters si possible), et trace Réel vs Prédit dans le temps.
+    """
+    import glob
+    import matplotlib.dates as mdates
+
+    files = sorted(glob.glob("TimeSeries_forecasting/cluster_*_predictions.csv"))
+    if not files:
+        print("[WARN] Aucun fichier de prédictions cluster_*_predictions.csv trouvé.")
+        return
+
+    # Concaténer toutes les prédictions
+    dfs = []
+    for f in files:
+        try:
+            d = pd.read_csv(f, parse_dates=[time_col])
+            dfs.append(d)
+        except Exception as e:
+            print(f"[WARN] Skip {f}: {e}")
+    if not dfs:
+        print("[WARN] Aucun CSV valide pour les prédictions.")
+        return
+
+    all_preds = pd.concat(dfs, ignore_index=True)
+
+    # Liste (cluster, ci_name) uniques
+    pairs = (all_preds[['cluster', 'ci_name']]
+             .drop_duplicates()
+             .sort_values(['cluster', 'ci_name']))
+    clusters = pairs['cluster'].unique()
+    n_clusters = len(clusters)
+
+    # Échantillonnage stratifié: ~10/n_clusters par cluster (au moins 1)
+    rng = np.random.default_rng(seed)
+    per_cluster = max(1, int(np.ceil(10 / n_clusters)))
+    sampled = []
+
+    for cl in clusters:
+        pool = pairs[pairs['cluster'] == cl]['ci_name'].values
+        take = min(per_cluster, len(pool))
+        if take > 0:
+            chosen = rng.choice(pool, size=take, replace=False)
+            sampled.extend([(cl, c) for c in chosen])
+
+    # Si on a plus que 10, tronquer; si moins que 10, compléter au hasard global
+    if len(sampled) > 10:
+        sampled = sampled[:10]
+    elif len(sampled) < 10:
+        rest = [(int(r['cluster']), r['ci_name']) for _, r in pairs.iterrows()
+                if (int(r['cluster']), r['ci_name']) not in sampled]
+        need = min(10 - len(sampled), len(rest))
+        if need > 0:
+            sampled.extend(rng.choice(rest, size=need, replace=False).tolist())
+
+    # Plot : 10 sous-graphiques
+    n = len(sampled)
+    if n == 0:
+        print("[WARN] Impossible d’échantillonner des équipements.")
+        return
+
+    rows = 5 if n > 5 else n
+    cols = 2 if n > 5 else 1
+
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 2.6*rows), sharex=False)
+    if n == 1:
+        axes = np.array([axes])  # uniformiser
+    axes = axes.flatten()
+
+    for i, (cl, ci) in enumerate(sampled):
+        ax = axes[i]
+        sub = (all_preds[(all_preds['cluster'] == cl) & (all_preds['ci_name'] == ci)]
+            .sort_values(time_col))
+
+        if sub.empty:
+            ax.set_title(f"Cluster {cl} (aucune donnée)")
+            continue
+
+        # downsample pour lisibilité si très long (ex: garder 400 points max)
+        if len(sub) > 400:
+            step = int(np.ceil(len(sub) / 400))
+            sub = sub.iloc[::step, :]
+
+        ax.plot(sub[time_col], sub[real_col], label='Réel', linewidth=1.2)
+        ax.plot(sub[time_col], sub[pred_col], label='Prédit', linewidth=1.2, alpha=0.9)
+
+        # Titre simplifié : uniquement le cluster
+        ax.set_title(f"Cluster {cl}")
+        ax.set_ylabel("Bande passante")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d\n%H:%M'))
+        ax.grid(True, linestyle='--', alpha=0.3)
+
+    # légende unique
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', ncol=2)
+    for j in range(i+1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.suptitle("Évolution de la bande passante — Réel vs Prédit (10 équipements)", y=0.995)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[OK] Graphe final sauvegardé : {out_path}")
+
+
 
 # Fonction principale
 def main():
     # Charger les données
-    df, cluster_df, features_df = load_data()
+    df, cluster_df = load_data()
+    features_df = None
     
     # Fusionner les données avec les clusters
     df = pd.merge(df, cluster_df, on='ci_name', how='inner')
@@ -859,6 +1290,11 @@ def main():
     plt.tight_layout()
     plt.savefig("TimeSeries_forecasting/clusters_comparison_r2.png")
     plt.close()
+
+    # ... après avoir traité tous les clusters et sauvegardé les CSV de prédictions
+    print('Génération des 10 plots')
+    plot_final_10_devices()
+
     
     print("\nTraitement terminé. Tous les résultats ont été sauvegardés dans le dossier 'TimeSeries_forecasting'.")
 

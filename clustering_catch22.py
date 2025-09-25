@@ -18,6 +18,8 @@ from tslearn.clustering import TimeSeriesKMeans
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 import os
 import warnings
+from sklearn.feature_selection import mutual_info_classif
+
 import hdbscan
 from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
 from kmodes.kmodes import KModes
@@ -62,13 +64,13 @@ except ImportError:
 warnings.filterwarnings('ignore')
 
 # Créer le dossier de résultats s'il n'existe pas
-os.makedirs('results_catch22/Interface_4', exist_ok=True)
-os.makedirs('results_catch22/Interface_4/feature_analysis', exist_ok=True)
-os.makedirs('results_catch22/Interface_4/dimensionality_reduction', exist_ok=True)
+os.makedirs('results_catch22_6/Interface', exist_ok=True)
+os.makedirs('results_catch22_6/Interface/feature_analysis', exist_ok=True)
+os.makedirs('results_catch22_6/Interface/dimensionality_reduction', exist_ok=True)
 
 # Charger les données
 print("Chargement des données...")
-df = pd.read_csv('Data/AllMonths/data_complete_interface.csv')
+df = pd.read_csv('Data_night/data_complete_interface.csv')
 
 # Ne garder que les 10 premieres lignes
 if not pd.api.types.is_datetime64_any_dtype(df['event_date_time']):
@@ -117,7 +119,7 @@ def investigate_weekly_patterns(df):
     plt.ylabel('Nombre d\'appareils')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('results_catch22/Interface_4/equipment_distribution_by_week.png', dpi=300)
+    plt.savefig('results_catch22_6/Interface/equipment_distribution_by_week.png', dpi=300)
     plt.close()
 
 def visualize_device_consistency(df, devices_by_week, low_percentage_weeks):
@@ -147,7 +149,7 @@ def visualize_device_consistency(df, devices_by_week, low_percentage_weeks):
     plt.xlabel("Semaine")
     plt.ylabel("Semaine")
     plt.tight_layout()
-    plt.savefig('results_catch22/Interface_4/device_similarity_matrix.png', dpi=300)
+    plt.savefig('results_catch22_6/Interface/device_similarity_matrix.png', dpi=300)
     plt.close()
     
     # Visualiser la distribution des appareils par semaine
@@ -173,7 +175,7 @@ def visualize_device_consistency(df, devices_by_week, low_percentage_weeks):
     plt.xlabel("Nombre de semaines")
     plt.ylabel("Nombre d'appareils")
     plt.tight_layout()
-    plt.savefig('results_catch22/Interface_4/device_week_distribution.png', dpi=300)
+    plt.savefig('results_catch22_6/Interface/device_week_distribution.png', dpi=300)
     plt.close()
 
 def fill_nan(df):
@@ -243,7 +245,7 @@ def fill_nan(df):
     # Vérifier les valeurs manquantes après le remplissage
     print("Valeurs manquantes après remplissage:")
     print(df_filled[['site_country', 'site_business_hours']].isnull().sum())
-    df_filled.to_csv("Data/AllMonths/data_complete_interface.csv")
+    df_filled.to_csv("Data_night/data_complete_interface.csv")
     return df_filled
 
 df = fill_nan(df)
@@ -727,7 +729,35 @@ def extract_time_series_features(group):
         **hourly_stats,
         **trend_seasonality
     }
+
+    ts = group['event_value_norm'].values
+    group['hour'] = group['event_date_time'].dt.hour
+    group['day_of_week'] = group['event_date_time'].dt.dayofweek
     
+    # --- Profil moyen par heure (0 à 23) ---
+    hourly_means = group.groupby('hour')['event_value_norm'].mean()
+    for h in range(24):
+        all_features[f'avg_hour_{h}'] = hourly_means.get(h, 0)
+    
+    # --- Profil moyen par jour de la semaine (0=lundi, 6=dimanche) ---
+    daily_means = group.groupby('day_of_week')['event_value_norm'].mean()
+    for d in range(7):
+        all_features[f'avg_day_{d}'] = daily_means.get(d, 0)
+    
+    # Après calcul des moyennes
+    hour_vals = np.array([all_features[f'avg_hour_{h}'] for h in range(24)])
+    if hour_vals.sum() > 0:
+        hour_vals_norm = hour_vals / hour_vals.sum()
+        for h in range(24):
+            all_features[f'avg_hour_norm_{h}'] = hour_vals_norm[h]
+
+    day_vals = np.array([all_features[f'avg_day_{d}'] for d in range(7)])
+    if day_vals.sum() > 0:
+        day_vals_norm = day_vals / day_vals.sum()
+        for d in range(7):
+            all_features[f'avg_day_norm_{d}'] = day_vals_norm[d]
+    all_features['night_day_ratio'] = (hour_vals[0:8].sum() + hour_vals[20:24].sum()) / (hour_vals[8:20].sum() + 1e-6)
+    all_features['weekend_week_ratio'] = day_vals[5:7].sum() / (day_vals[0:5].sum() + 1e-6)
     return all_features
 
 # Extraire les caractéristiques pour chaque équipement
@@ -776,12 +806,55 @@ print(f"Pourcentage de valeurs aberrantes: {np.sum(outliers == -1) / len(outlier
 # Créer un DataFrame sans les valeurs aberrantes
 features_df_no_outliers = features_df[outliers == 1].copy()
 print(f"Forme du DataFrame après suppression des valeurs aberrantes: {features_df_no_outliers.shape}")
+print("Pre clustering (profil horaire/jour)")
+
+hour_day_cols = [f'avg_hour_norm_{h}' for h in range(24)] + \
+                [f'avg_day_norm_{d}' for d in range(7)] + \
+                ['night_day_ratio', 'weekend_week_ratio']
+
+missing = [c for c in hour_day_cols if c not in features_df_no_outliers.columns]
+if not missing:
+    X_time_profile = StandardScaler().fit_transform(features_df_no_outliers[hour_day_cols])
+
+    best_k, best_s = None, -1
+    for k in [2, 3, 4, 5]:
+        km = KMeans(n_clusters=k, random_state=42, n_init=20)
+        labels = km.fit_predict(X_time_profile)
+        s = silhouette_score(X_time_profile, labels)
+        print(f"[TIME-PROFILE] k={k}, silhouette={s:.3f}")
+        if s > best_s:
+            best_s, best_k, best_labels_time = s, k, labels
+
+    # Sauvegarde/visu rapide
+    pca = PCA(n_components=2)
+    Xp = pca.fit_transform(X_time_profile)
+    plt.figure(figsize=(8,6))
+    plt.scatter(Xp[:,0], Xp[:,1], c=best_labels_time, alpha=0.7)
+    plt.title(f'Profil horaire/journalier – KMeans k={best_k}, silhouette={best_s:.3f}')
+    plt.savefig('results_catch22_6/Interface/dimensionality_reduction/time_profile_clustering.png', dpi=300)
+    plt.close()
+
+    # Option : ajouter ce label comme pseudo-feature pour la suite
+    features_df_no_outliers['time_profile_cluster'] = best_labels_time
+    categorical_cols = features_df_no_outliers.select_dtypes(include=['object', 'category']).columns.tolist()
+    if 'ci_name' in categorical_cols: categorical_cols.remove('ci_name')
+else:
+    print(f"[TIME-PROFILE] Colonnes manquantes: {missing}")
+
+hour_day_keep = [f'avg_hour_norm_{h}' for h in range(24)] + \
+                [f'avg_day_norm_{d}' for d in range(7)] + \
+                ['night_day_ratio', 'weekend_week_ratio']
 
 # Sélection de caractéristiques basée sur la variance
 print("Sélection de caractéristiques basée sur la variance...")
 selector = VarianceThreshold(threshold=0.01)  # Supprimer les caractéristiques avec une variance < 0.01
 X_var_selected = selector.fit_transform(features_df_no_outliers[numerical_cols])
-selected_features = [numerical_cols[i] for i in range(len(numerical_cols)) if selector.get_support()[i]]
+selected_features = [numerical_cols[i] for i, keep in enumerate(selector.get_support()) if keep]
+
+for c in hour_day_keep:
+    if c in features_df_no_outliers.columns and c not in selected_features:
+        selected_features.append(c)
+
 print(f"Nombre de caractéristiques après sélection par variance: {len(selected_features)}")
 
 # Réduction des caractéristiques corrélées
@@ -812,7 +885,7 @@ plt.plot(np.cumsum(pca.explained_variance_ratio_))
 plt.xlabel('Nombre de composantes')
 plt.ylabel('Variance expliquée cumulée')
 plt.grid(True)
-plt.savefig('results_catch22/Interface_4/dimensionality_reduction/pca_variance_explained.png', dpi=300)
+plt.savefig('results_catch22_6/Interface/dimensionality_reduction/pca_variance_explained.png', dpi=300)
 plt.close()
 
 # Visualisation t-SNE des données
@@ -823,7 +896,7 @@ X_tsne = tsne.fit_transform(StandardScaler().fit_transform(features_df_no_outlie
 plt.figure(figsize=(10, 8))
 plt.scatter(X_tsne[:, 0], X_tsne[:, 1], alpha=0.7)
 plt.title('Visualisation t-SNE des données')
-plt.savefig('results_catch22/Interface_4/dimensionality_reduction/tsne_visualization.png', dpi=300)
+plt.savefig('results_catch22_6/Interface/dimensionality_reduction/tsne_visualization.png', dpi=300)
 plt.close()
 
 # Prétraitement des données pour le clustering
@@ -920,9 +993,9 @@ def visualize_clusters(X, labels, algorithm_name, n_clusters=None, use_tsne=Fals
     
     # Sauvegarder le graphique
     if n_clusters:
-        plt.savefig(f'results_catch22/Interface_4/{method.lower()}_clusters_{algorithm_name}_k{n_clusters}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'results_catch22_6/Interface/{method.lower()}_clusters_{algorithm_name}_k{n_clusters}.png', dpi=300, bbox_inches='tight')
     else:
-        plt.savefig(f'results_catch22/Interface_4/{method.lower()}_clusters_{algorithm_name}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'results_catch22_6/Interface/{method.lower()}_clusters_{algorithm_name}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 # Fonction pour analyser l'importance des caractéristiques dans chaque cluster
@@ -1237,7 +1310,7 @@ def run_clustering_algorithms(X, ci_names, selected_features, features_df_no_out
             features_df_no_outliers, 
             best_result['labels'], 
             selected_features,
-            f"results_catch22/Interface_4/feature_analysis/{best_result['algorithm']}_k{best_result['n_clusters']}"
+            f"results_catch22_6/Interface/feature_analysis/{best_result['algorithm']}_k{best_result['n_clusters']}"
         )
         
         # Créer un DataFrame avec les noms des équipements et leurs clusters
@@ -1247,7 +1320,7 @@ def run_clustering_algorithms(X, ci_names, selected_features, features_df_no_out
         })
         
         # Sauvegarder les assignations de clusters
-        cluster_assignments.to_csv(f'results_catch22/Interface_4/best_cluster_assignments_{best_result["algorithm"]}_k{best_result["n_clusters"]}.csv', index=False)
+        cluster_assignments.to_csv(f'results_catch22_6/Interface/best_cluster_assignments_{best_result["algorithm"]}_k{best_result["n_clusters"]}.csv', index=False)
     
     return results
 
@@ -1281,7 +1354,7 @@ pseudo_labels = kmeans_init.fit_predict(StandardScaler().fit_transform(features_
 
 # Étape 2: Utiliser ces labels pour sélectionner les caractéristiques les plus discriminantes
 # Option 1: Information mutuelle
-selector_mi = SelectKBest(mutual_info_regression, k=min(50, len(selected_features)))
+selector_mi = SelectKBest(mutual_info_classif, k=min(50, len(selected_features)))
 selector_mi.fit(features_df_no_outliers[selected_features], pseudo_labels)
 mi_scores = selector_mi.scores_
 mi_features = [selected_features[i] for i in selector_mi.get_support(indices=True)]
@@ -1304,7 +1377,7 @@ feature_importance_df = pd.DataFrame({
     'rf_importance': rf_importances
 })
 feature_importance_df = feature_importance_df.sort_values('rf_importance', ascending=False)
-feature_importance_df.to_csv('results_catch22/Interface_4/feature_importance.csv', index=False)
+feature_importance_df.to_csv('results_catch22_6/Interface/feature_importance.csv', index=False)
 
 # Visualiser l'importance des caractéristiques
 plt.figure(figsize=(12, 8))
@@ -1313,7 +1386,7 @@ plt.xlabel('Importance')
 plt.ylabel('Caractéristique')
 plt.title('Top 20 caractéristiques les plus importantes (Random Forest)')
 plt.tight_layout()
-plt.savefig('results_catch22/Interface_4/feature_importance_rf.png', dpi=300)
+plt.savefig('results_catch22_6/Interface/feature_importance_rf.png', dpi=300)
 plt.close()
 
 
@@ -1356,7 +1429,7 @@ for group_name, features in feature_groups.items():
         plt.figure(figsize=(10, 8))
         plt.scatter(X_group_pca[:, 0], X_group_pca[:, 1], c=labels, cmap='viridis', alpha=0.7)
         plt.title(f'Clustering sur groupe {group_name}, Silhouette = {score:.4f}')
-        plt.savefig(f'results_catch22/Interface_4/subspace_clustering_{group_name}.png', dpi=300)
+        plt.savefig(f'results_catch22_6/Interface/subspace_clustering_{group_name}.png', dpi=300)
         plt.close()
     except Exception as e:
         print(f"  Erreur lors de l'évaluation: {e}")
@@ -1431,7 +1504,7 @@ for name, embedding in embeddings.items():
         plt.figure(figsize=(10, 8))
         plt.scatter(embedding[:, 0], embedding[:, 1], c=labels, cmap='viridis', alpha=0.7)
         plt.title(f'Clustering avec {name}, Silhouette = {score_orig:.4f}')
-        plt.savefig(f'results_catch22/Interface_4/dimensionality_reduction/clustering_{name}.png', dpi=300)
+        plt.savefig(f'results_catch22_6/Interface/dimensionality_reduction/clustering_{name}.png', dpi=300)
         plt.close()
     except Exception as e:
         print(f"  Erreur lors de l'évaluation: {e}")
@@ -1572,7 +1645,7 @@ if len(partitions) >= 5:
         plt.imshow(co_association, cmap='viridis')
         plt.colorbar(label='Probabilité de co-association')
         plt.title('Matrice de co-association')
-        plt.savefig('results_catch22/Interface_4/consensus_co_association.png', dpi=300)
+        plt.savefig('results_catch22_6/Interface/consensus_co_association.png', dpi=300)
         plt.close()
         
         # Visualiser les clusters consensuels
@@ -1583,13 +1656,13 @@ if len(partitions) >= 5:
         plt.figure(figsize=(10, 8))
         plt.scatter(X_pca[:, 0], X_pca[:, 1], c=consensus_kmeans_labels, cmap='viridis', alpha=0.7)
         plt.title(f'Clustering consensuel (KMeans), Silhouette = {consensus_kmeans_silhouette:.4f}')
-        plt.savefig('results_catch22/Interface_4/consensus_kmeans_clusters.png', dpi=300)
+        plt.savefig('results_catch22_6/Interface/consensus_kmeans_clusters.png', dpi=300)
         plt.close()
         
         plt.figure(figsize=(10, 8))
         plt.scatter(X_pca[:, 0], X_pca[:, 1], c=consensus_hclust_labels, cmap='viridis', alpha=0.7)
         plt.title(f'Clustering consensuel (HClust), Silhouette = {consensus_hclust_silhouette:.4f}')
-        plt.savefig('results_catch22/Interface_4/consensus_hclust_clusters.png', dpi=300)
+        plt.savefig('results_catch22_6/Interface/consensus_hclust_clusters.png', dpi=300)
         plt.close()
     except Exception as e:
         print(f"Erreur lors de l'évaluation du clustering consensuel: {e}")
@@ -1606,8 +1679,8 @@ clustering_results = run_clustering_algorithms(X, ci_names, selected_features, f
 results_df = pd.DataFrame([{k: v for k, v in r.items() if k != 'labels'} for r in clustering_results])
 
 # Sauvegarder les résultats dans un CSV
-results_df.to_csv('results_catch22/Interface_4/clustering_metrics.csv', index=False)
-print("\nRésultats sauvegardés dans 'results_catch22/Interface_4/clustering_metrics.csv'")
+results_df.to_csv('results_catch22_6/Interface/clustering_metrics.csv', index=False)
+print("\nRésultats sauvegardés dans 'results_catch22_6/Interface/clustering_metrics.csv'")
 
 # Afficher les résultats
 print("\nRésultats des métriques de clustering:")
@@ -1669,7 +1742,7 @@ plt.legend()
 plt.grid(True)
 
 plt.tight_layout()
-plt.savefig('results_catch22/Interface_4/clustering_metrics_comparison.png', dpi=300, bbox_inches='tight')
+plt.savefig('results_catch22_6/Interface/clustering_metrics_comparison.png', dpi=300, bbox_inches='tight')
 plt.close()
 
 # Identifier la meilleure configuration globale
@@ -1685,15 +1758,61 @@ print("\nMeilleure configuration globale (basée sur le classement combiné des 
 print(best_overall)
 
 # Sauvegarder le DataFrame avec les rangs
-results_df.to_csv('results_catch22/Interface_4/clustering_metrics_with_ranks.csv', index=False)
+results_df.to_csv('results_catch22_6/Interface/clustering_metrics_with_ranks.csv', index=False)
 
 # Récupérer les labels du meilleur algorithme
 best_algo = best_overall['algorithm']
 best_n_clusters = best_overall['n_clusters']
 best_result = next((r for r in clustering_results if r['algorithm'] == best_algo and r['n_clusters'] == best_n_clusters), None)
 
+top_15_results = results_df.nsmallest(15, 'combined_rank')
 
-
+# Parcourir ces 15 configurations
+for idx, row in top_15_results.iterrows():
+    print(f"\nTraitement de la configuration {idx + 1} :")
+    print(row)
+    
+    # Récupérer les paramètres
+    algo = row['algorithm']
+    n_clusters = row['n_clusters']
+    
+    # Récupérer les résultats correspondants
+    result = next((r for r in clustering_results if r['algorithm'] == algo and r['n_clusters'] == n_clusters), None)
+    
+    if result:
+        labels = result['labels']
+        
+        # Créer un DataFrame avec les noms des équipements et leurs clusters
+        cluster_assignments = pd.DataFrame({
+            'ci_name': ci_names,
+            'cluster': labels
+        })
+        
+        # Sauvegarder les assignations de clusters pour chaque configuration
+        filename = f"results_catch22_6/Interface/cluster_assignments_{algo}_{n_clusters}.csv"
+        cluster_assignments.to_csv(filename, index=False)
+        
+        # Statistiques par cluster
+        features_with_clusters = features_df_no_outliers.copy()
+        features_with_clusters['cluster'] = labels
+        numeric_cols = features_with_clusters.select_dtypes(include=['int64', 'float64']).columns
+        cluster_stats = features_with_clusters.groupby('cluster')[numeric_cols].mean()
+        
+        # Sauvegarder les statistiques pour chaque configuration
+        stats_filename = f"results_catch22_6/Interface/cluster_statistics_{algo}_{n_clusters}.csv"
+        cluster_stats.to_csv(stats_filename)
+        
+        # Visualiser les clusters
+        visualize_clusters(X, labels, f"{algo}_n_clusters_{n_clusters}", n_clusters)
+        visualize_clusters(X, labels, f"{algo}_n_clusters_{n_clusters}", n_clusters, use_tsne=True)
+        
+        # Analyse détaillée des caractéristiques par cluster
+        analyze_feature_importance(
+            features_df_no_outliers, 
+            labels, 
+            selected_features,
+            f"results_catch22_6/Interface/feature_analysis/{algo}_n_clusters_{n_clusters}"
+        )
 
 if best_result:
     best_labels = best_result['labels']
@@ -1705,7 +1824,7 @@ if best_result:
     })
     
     # Sauvegarder les assignations de clusters
-    cluster_assignments.to_csv('results_catch22/Interface_4/best_cluster_assignments.csv', index=False)
+    cluster_assignments.to_csv('results_catch22_6/Interface/best_cluster_assignments.csv', index=False)
     
     # Visualiser le meilleur clustering avec PCA et t-SNE
     visualize_clusters(X, best_labels, f"{best_algo}_best", best_n_clusters)
@@ -1718,14 +1837,14 @@ if best_result:
     # Statistiques par cluster
     numeric_cols = features_with_clusters.select_dtypes(include=['int64','float64']).columns
     cluster_stats = features_with_clusters.groupby('cluster')[numeric_cols].mean()
-    cluster_stats.to_csv('results_catch22/Interface_4/cluster_statistics.csv')
+    cluster_stats.to_csv('results_catch22_6/Interface/cluster_statistics.csv')
     
     # Analyse détaillée des caractéristiques par cluster
     analyze_feature_importance(
         features_df_no_outliers, 
         best_labels, 
         selected_features,
-        f"results_catch22/Interface_4/feature_analysis/best_overall"
+        f"results_catch22_6/Interface/feature_analysis/best_overall"
     )
     
     # Visualiser la distribution des clusters
@@ -1736,7 +1855,7 @@ if best_result:
     plt.xlabel('Cluster')
     plt.ylabel('Nombre d\'équipements')
     plt.grid(True, axis='y')
-    plt.savefig('results_catch22/Interface_4/cluster_distribution.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results_catch22_6/Interface/cluster_distribution.png', dpi=300, bbox_inches='tight')
     plt.close()
     
     # Créer un dendrogramme pour le clustering hiérarchique si c'est le meilleur
@@ -1747,7 +1866,7 @@ if best_result:
         plt.title(f'Dendrogramme du clustering hiérarchique ({best_algo})')
         plt.xlabel('Équipements')
         plt.ylabel('Distance')
-        plt.savefig('results_catch22/Interface_4/hierarchical_dendrogram.png', dpi=300, bbox_inches='tight')
+        plt.savefig('results_catch22_6/Interface/hierarchical_dendrogram.png', dpi=300, bbox_inches='tight')
         plt.close()
     
     print("\nAnalyse de clustering terminée avec succès!")
@@ -1758,4 +1877,4 @@ if best_result:
 else:
     print("\nErreur: Impossible de récupérer les labels du meilleur algorithme.")
 
-print("\nTous les résultats ont été sauvegardés dans le dossier 'results_catch22/Interface_4/'.")
+print("\nTous les résultats ont été sauvegardés dans le dossier 'results_catch22_6/Interface/'.")
